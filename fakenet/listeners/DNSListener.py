@@ -4,6 +4,7 @@ import threading
 import netifaces
 import SocketServer
 from dnslib import *
+from netaddr import IPAddress,IPNetwork
 
 import ssl
 import socket
@@ -24,15 +25,15 @@ class DNSListener(object):
         return confidence + 2
 
     def __init__(
-            self, 
-            config={}, 
-            name='DNSListener', 
-            logging_level=logging.INFO, 
+            self,
+            config={},
+            name='DNSListener',
+            logging_level=logging.INFO,
             ):
 
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging_level)
-            
+
         self.config = config
         self.local_ip = '0.0.0.0'
         self.server = None
@@ -47,7 +48,7 @@ class DNSListener(object):
 
     def start(self):
 
-        # Start UDP listener  
+        # Start UDP listener
         if self.config['protocol'].lower() == 'udp':
             self.logger.debug('Starting UDP ...')
             self.server = ThreadedUDPServer((self.local_ip, int(self.config.get('port', 53))), self.config, self.logger, UDPHandler)
@@ -59,26 +60,47 @@ class DNSListener(object):
 
         self.server.nxdomains = int(self.config.get('nxdomains', 0))
 
+        # Fail on first NX request for a FQDN
+        self.server.fail_once = self.server.config.get('failonce', False)
+
+        # Setup an IP range to hand out for requests if CIDR is specified
+        nx_response = self.server.config.get('responsea', '')
+        if '/' in nx_response:
+            self.server.ip_range = IPNetwork(nx_response).iter_hosts()
+
         self.server_thread = threading.Thread(target=self.server.serve_forever)
         self.server_thread.daemon = True
         self.server_thread.start()
 
     def stop(self):
         self.logger.debug('Stopping...')
-        
+
         # Stop listener
         if self.server:
             self.server.shutdown()
-            self.server.server_close()  
+            self.server.server_close()
 
 
 class DNSHandler():
-           
+    fqdn_to_address_dict = {}
+
+    def get_address(self, fqdn):
+        address = DNSHandler.fqdn_to_address_dict.get(fqdn, None)
+        if not address:
+            lock = threading.Lock()
+            with lock:
+                address = str(self.server.ip_range.next())
+                DNSHandler.fqdn_to_address_dict[fqdn] = address
+
+            if self.server.fail_once.lower() == 'true':
+                address = None
+        return address
+
     def parse(self,data):
         response = ""
-    
+
         try:
-            # Parse data as DNS        
+            # Parse data as DNS
             d = DNSRecord.parse(data)
 
         except Exception, e:
@@ -88,15 +110,15 @@ class DNSHandler():
                 self.server.logger.info(line)
             self.server.logger.info('%s', '-'*80,)
 
-        else:                 
+        else:
             # Only Process DNS Queries
             if QR[d.header.qr] == "QUERY":
-                     
+
                 # Gather query parameters
                 # NOTE: Do not lowercase qname here, because we want to see
                 #       any case request weirdness in the logs.
                 qname = str(d.q.qname)
-                
+
                 # Chop off the last period
                 if qname[-1] == '.': qname = qname[:-1]
 
@@ -140,7 +162,7 @@ class DNSHandler():
                     # The DNSResponse setting was previously statically set to
                     # 192.0.2.123, which for local scenarios works fine in Windows
                     # standalone use cases because all connections to IP addresses
-                    # are redirected by Diverter. Changing the default setting to 
+                    # are redirected by Diverter. Changing the default setting to
                     #
                     # IPv6 is not yet implemented, but when it is, it will be
                     # necessary to consider how to get similar behavior to
@@ -155,10 +177,20 @@ class DNSHandler():
                                         break
                     elif fake_record == 'GetHostByName' or fake_record is None:
                         fake_record = socket.gethostbyname(socket.gethostname())
+                    elif self.server.ip_range:
+                        fake_record = self.get_address(qname)
 
-                    if self.server.nxdomains > 0:
+                    if self.server.nxdomains > 0 or fake_record is None:
+                        # https://tools.ietf.org/html/rfc2308
+                        # According to RFC setting Name Error + an empty resonse,
+                        # w/o SOA the response will not be cached, this isn't true
+                        # at least for windows XP :(
+                        # response.header.set_rcode(3) # Name Error
+                        # Sending an empty response also seems to be cached
+                        response.header.set_rcode(2) # what Inetsim does
                         self.server.logger.info('Ignoring query. NXDomains: %d', self.server.nxdomains)
-                        self.server.nxdomains -= 1
+                        if fake_record:
+                            self.server.nxdomains -= 1
                     else:
                         self.server.logger.info('Responding with \'%s\'', fake_record)
                         response.add_answer(RR(qname, getattr(QTYPE,qtype), rdata=RDMAP[qtype](fake_record)))
@@ -182,8 +214,8 @@ class DNSHandler():
                     response.add_answer(RR(qname, getattr(QTYPE,qtype), rdata=RDMAP[qtype](fake_record)))
 
                 response = response.pack()
-                
-        return response  
+
+        return response
 
 class UDPHandler(DNSHandler, SocketServer.BaseRequestHandler):
 
@@ -211,17 +243,17 @@ class TCPHandler(DNSHandler, SocketServer.BaseRequestHandler):
 
         try:
             data = self.request.recv(1024)
-            
+
             # Remove the addition "length" parameter used in the
             # TCP DNS protocol
             data = data[2:]
             response = self.parse(data)
-            
+
             if response:
                 # Calculate and add the additional "length" parameter
-                # used in TCP DNS protocol 
-                length = binascii.unhexlify("%04x" % len(response))            
-                self.request.sendall(length+response)      
+                # used in TCP DNS protocol
+                length = binascii.unhexlify("%04x" % len(response))
+                self.request.sendall(length+response)
 
         except socket.timeout:
             self.server.logger.warning('Connection timeout.')
@@ -241,7 +273,7 @@ class ThreadedUDPServer(SocketServer.ThreadingMixIn, SocketServer.UDPServer):
         SocketServer.UDPServer.__init__(self, server_address, RequestHandlerClass)
 
 class ThreadedTCPServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
-    
+
     # Override default value
     allow_reuse_address = True
 
@@ -293,7 +325,7 @@ def test(config):
 
 def main():
     logging.basicConfig(format='%(asctime)s [%(name)15s] %(message)s', datefmt='%m/%d/%y %I:%M:%S %p', level=logging.DEBUG)
-    
+
     config = {'port': '53', 'protocol': 'UDP', 'responsea': '127.0.0.1', 'responsemx': 'mail.bad.com', 'responsetxt': 'FAKENET', 'nxdomains': 3 }
 
     listener = DNSListener(config, logging_level = logging.DEBUG)
